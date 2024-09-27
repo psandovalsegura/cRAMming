@@ -72,6 +72,7 @@ wandb_project = 'cRAMming'
 wandb_run_name = f"{model_name.split('/')[-1]}-{init_from}" # 'run' + str(time.time())
 # data
 data_dir = 'data'
+gradient_accumulation_steps = 5 * 8 # used to simulate larger batch sizes
 batch_size = 1 
 block_size = 4096
 # adamw optimizer
@@ -92,6 +93,7 @@ device = 'cuda' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps'
 dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16' # 'float32', 'bfloat16', or 'float16', the latter will auto implement a GradScaler
 compile = False # use PyTorch 2.0 to compile the model to be faster
 cramming_offload_optim_cpu = True
+cramming_offload_gradients_cpu = False
 cramming_activation_checkpointing = True
 cramming_fuse_optim_backward = False
 using_preemptible = False # whether running on a preemptible instance
@@ -149,7 +151,7 @@ def configure_optimizers(model, weight_decay, learning_rate, betas, device_type)
     fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
     use_fused = fused_available and device_type == 'cuda'
     if cramming_offload_optim_cpu:
-        optimizer = CPUOffloadOptimizer(optim_groups, torch.optim.AdamW, offload_gradients=True, fused=use_fused, lr=learning_rate, betas=betas)
+        optimizer = CPUOffloadOptimizer(optim_groups, torch.optim.AdamW, offload_gradients=cramming_offload_gradients_cpu, fused=use_fused, lr=learning_rate, betas=betas)
         print("Using CPU Offload Optimizer")
     else:
         optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas, fused=use_fused)
@@ -168,13 +170,13 @@ def configure_fused_optimizers(model, weight_decay, learning_rate, betas, device
             if p.dim() >= 2:
                 # use weight decay
                 if cramming_offload_optim_cpu:
-                    optimizer_dict[p] = CPUOffloadOptimizer([p], torch.optim.AdamW, offload_gradients=True, fused=use_fused, lr=learning_rate, betas=betas, weight_decay=weight_decay)
+                    optimizer_dict[p] = CPUOffloadOptimizer([p], torch.optim.AdamW, offload_gradients=cramming_offload_gradients_cpu, fused=use_fused, lr=learning_rate, betas=betas, weight_decay=weight_decay)
                 else:
                     optimizer_dict[p] = torch.optim.AdamW([p], lr=learning_rate, betas=betas, weight_decay=weight_decay, fused=use_fused)
             else:
                 # no weight decay
                 if cramming_offload_optim_cpu:
-                    optimizer_dict[p] = CPUOffloadOptimizer([p], torch.optim.AdamW, offload_gradients=True, fused=use_fused, lr=learning_rate, betas=betas, weight_decay=0.0)
+                    optimizer_dict[p] = CPUOffloadOptimizer([p], torch.optim.AdamW, offload_gradients=cramming_offload_gradients_cpu, fused=use_fused, lr=learning_rate, betas=betas, weight_decay=0.0)
                 else:
                     optimizer_dict[p] = torch.optim.AdamW([p], lr=learning_rate, betas=betas, weight_decay=0.0, fused=use_fused)
     def optimizer_hook(parameter):
@@ -215,13 +217,18 @@ if ddp:
     torch.cuda.set_device(device)
     master_process = ddp_rank == 0 # this process will do logging, checkpointing etc.
     seed_offset = ddp_rank # each process gets a different seed
+    # world_size number of processes will be training simultaneously, so we can scale
+    # down the desired gradient accumulation iterations per process proportionally
+    assert gradient_accumulation_steps % ddp_world_size == 0
+    gradient_accumulation_steps //= ddp_world_size
 else:
     # if not ddp, we are running on a single gpu, and one process
     master_process = True
     seed_offset = 0
     ddp_world_size = 1
-tokens_per_iter = ddp_world_size * batch_size * block_size
+tokens_per_iter = gradient_accumulation_steps * ddp_world_size * batch_size * block_size
 print(f"Tokens per iteration: {tokens_per_iter:,}")
+print(f"Tokens per wandb step: {tokens_per_iter * eval_interval:,}")
 
 if master_process:
     os.makedirs(out_dir, exist_ok=True)
@@ -395,11 +402,13 @@ while True:
         break
 
     # forward backward update, with optional gradient accumulation to simulate larger batch size
-    with ctx:
-        loss = model(input_ids=X, labels=Y, use_cache=False).loss
-    # immediately async prefetch next batch while model is doing the forward pass on the GPU
-    loss.backward()
-    X, Y = get_batch('train')
+    for micro_step in range(gradient_accumulation_steps):
+        with ctx:
+            loss = model(input_ids=X, labels=Y, use_cache=False).loss
+            loss = loss / gradient_accumulation_steps # scale the loss to account for gradient accumulation
+        # immediately async prefetch next batch while model is doing the forward pass on the GPU
+        loss.backward()
+        X, Y = get_batch('train')
 
     # step the optimizer
     if not cramming_fuse_optim_backward: # not needed for optimizer fused into backward pass
