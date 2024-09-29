@@ -7,7 +7,7 @@ cache_dir = '/fs/nexus-scratch/psando/huggingface' # where to store huggingface 
 
 # wandb logging
 wandb_log = True
-wandb_project = 'cRAMming'
+wandb_project = 'cRAMming-2024-09-29'
 wandb_run_name = f"{model_name.split('/')[-1]}-{init_from}" # 'run' + str(time.time())
 
 # data
@@ -18,6 +18,7 @@ data_dir = '/fs/nexus-scratch/psando/owt/llama-owt/'
 # 12 batch size * 1024 block size * 5 gradaccum * 1 GPU = 61,440
 batch_size = 1
 block_size = 4096
+gradient_accumulation_steps = 1
 
 # this makes total number of tokens be 300B
 max_iters = 600000

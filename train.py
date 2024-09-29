@@ -29,7 +29,7 @@ import torch
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
 
-from transformers import AutoConfig, AutoModelForCausalLM
+from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 from liger_kernel.transformers.monkey_patch import _apply_liger_kernel, MODEL_TYPE_TO_APPLY_LIGER_FN
 from torchao.prototype.low_bit_optim import CPUOffloadOptimizer
 
@@ -93,7 +93,7 @@ device = 'cuda' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps'
 dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16' # 'float32', 'bfloat16', or 'float16', the latter will auto implement a GradScaler
 compile = False # use PyTorch 2.0 to compile the model to be faster
 cramming_offload_optim_cpu = True
-cramming_offload_gradients_cpu = False
+cramming_offload_gradients_cpu = True
 cramming_activation_checkpointing = True
 cramming_fuse_optim_backward = False
 using_preemptible = False # whether running on a preemptible instance
@@ -251,13 +251,12 @@ def get_batch(split):
         data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint16, mode='r')
     ix = torch.randint(len(data) - block_size, (batch_size,))
     x = torch.stack([torch.from_numpy((data[i:i+block_size]).astype(np.int64)) for i in ix])
-    y = torch.stack([torch.from_numpy((data[i+1:i+1+block_size]).astype(np.int64)) for i in ix])
     if device_type == 'cuda':
         # pin arrays x,y, which allows us to move them to GPU asynchronously (non_blocking=True)
-        x, y = x.pin_memory().to(device, non_blocking=True), y.pin_memory().to(device, non_blocking=True)
+        x = x.pin_memory().to(device, non_blocking=True)
     else:
-        x, y = x.to(device), y.to(device)
-    return x, y
+        x = x.to(device)
+    return x
 
 # init these up here, can override if init_from='resume' (i.e. from a checkpoint)
 iter_num = 0
@@ -265,27 +264,18 @@ best_val_loss = 1e9
 
 # model init
 if init_from == 'resume':
-    # TODO: implement resume from checkpoint without constructing random init model (leads to OOM)
-    raise NotImplementedError("Resume from checkpoint not yet implemented")
     # resume training from latest checkpoint
-    ckpt_file = max([f for f in os.listdir(out_dir) if f.endswith('.pt')], key=lambda x: int(x.split('_')[-1].split('.')[0]))
+    ckpt_file = max([f for f in os.listdir(out_dir) if f.startswith('ckpt_iter_')], key=lambda x: int(x.split('_')[-1].split('.')[0]))
     ckpt_path = os.path.join(out_dir, ckpt_file)
-    print(f"Resuming training from {ckpt_path}")
-    checkpoint = torch.load(ckpt_path, map_location=device)
-    checkpoint_model_args = checkpoint['model_args']
-    # force these config attributes to be equal otherwise we can't even resume training
+    checkpoint = torch.load(ckpt_path, map_location='cpu')
+    checkpoint_model_args, iter_num, best_val_loss = checkpoint['model_args'], checkpoint['iter_num'], checkpoint['best_val_loss']
+    print(f"Resuming training from checkpoint:\n\tPath:{ckpt_path}\n\tIter:{iter_num}\n\tBest val loss:{best_val_loss}\n\tModel args:{checkpoint_model_args}")
     # create the model
     model = liger_kernel_for_causal_lm(**checkpoint_model_args)
     state_dict = checkpoint['model']
-    # fix the keys of the state dictionary :(
-    # honestly no idea how checkpoints sometimes get this prefix, have to debug more
-    unwanted_prefix = '_orig_mod.'
-    for k,v in list(state_dict.items()):
-        if k.startswith(unwanted_prefix):
-            state_dict[k[len(unwanted_prefix):]] = state_dict.pop(k)
     model.load_state_dict(state_dict)
-    iter_num = checkpoint['iter_num']
-    best_val_loss = checkpoint['best_val_loss']
+    # free model state dict cpu memory
+    del checkpoint['model']
 elif init_from in ['pretrained', 'scratch']:
     model = liger_kernel_for_causal_lm(init_from, model_name, cache_dir)
     # activation checkpointing
@@ -299,6 +289,10 @@ else:
     raise ValueError(f"Unknown init_from value: {init_from}")
 
 model.to(device)
+tokenizer = AutoTokenizer.from_pretrained(model_name, cache_dir=cache_dir)
+eval_prompt = 'Llama 2 is a language model that'
+eval_prompt = tokenizer(eval_prompt, return_tensors='pt').input_ids
+generation_max_len = 64
 
 # optimizer
 if cramming_fuse_optim_backward:
@@ -307,6 +301,8 @@ else:
     optimizer = configure_optimizers(model, weight_decay, learning_rate, (beta1, beta2), device_type)
 if init_from == 'resume':
     optimizer.load_state_dict(checkpoint['optimizer'])
+    # free optimizer state dict cpu memory
+    del checkpoint['optimizer']
 checkpoint = None # free up memory
 
 # compile the model
@@ -321,17 +317,22 @@ if ddp:
 
 # helps estimate an arbitrarily accurate loss over either split using many batches
 @torch.no_grad()
-def estimate_loss():
+def estimate_loss_and_generate():
     out = {}
     model.eval()
     for split in ['train', 'val']:
         losses = torch.zeros(eval_iters)
         for k in range(eval_iters):
-            X, Y = get_batch(split)
+            X = get_batch(split)
             with ctx:
-                loss = model(input_ids=X, labels=Y, use_cache=False).loss
+                loss = model(input_ids=X, labels=X, use_cache=False).loss
             losses[k] = loss.item()
         out[split] = losses.mean()
+    
+    # generate some text
+    outputs = model.generate(eval_prompt.to(device), max_length=generation_max_len, 
+                             do_sample=True, temperature=0.7, pad_token_id=tokenizer.eos_token_id)
+    out['text'] = tokenizer.decode(outputs[0], skip_special_tokens=True)
     model.train()
     return out
 
@@ -352,10 +353,12 @@ def get_lr(it):
 # logging
 if wandb_log and master_process:
     import wandb
+    # add tokens_per_wandb_step to config for easy reference in wandb
+    config['tokens_per_wandb_step'] = tokens_per_iter * eval_interval
     wandb.init(project=wandb_project, name=wandb_run_name, config=config)
 
 # training loop
-X, Y = get_batch('train') # fetch the very first batch
+X = get_batch('train') # fetch the very first batch
 t0 = time.time()
 local_iter_num = 0 # number of iterations in the lifetime of this process
 raw_model = model.module if ddp else model # unwrap DDP container if needed
@@ -374,18 +377,20 @@ while True:
 
     # evaluate the loss on train/val sets and write checkpoints
     if iter_num % eval_interval == 0 and master_process:
-        losses = estimate_loss()
-        print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
+        eval_out = estimate_loss_and_generate()
+        print(f"step {iter_num}: train loss {eval_out['train']:.4f}, val loss {eval_out['val']:.4f}")
+        print(f"generated text: {eval_out['text']}")
         if wandb_log:
             wandb.log({
                 "iter": iter_num,
-                "train/loss": losses['train'],
-                "val/loss": losses['val'],
+                "train_loss": eval_out['train'],
+                "val_loss": eval_out['val'],
                 "lr": lr,
                 "mfu": running_mfu*100, # convert to percentage
+                "text_sample": eval_out['text'],
             })
-        if losses['val'] < best_val_loss:
-            best_val_loss = losses['val']
+        if eval_out['val'] < best_val_loss:
+            best_val_loss = eval_out['val']
             if iter_num > 0 and save_checkpoints:
                 checkpoint = {
                     'model': raw_model.state_dict(),
@@ -404,11 +409,11 @@ while True:
     # forward backward update, with optional gradient accumulation to simulate larger batch size
     for micro_step in range(gradient_accumulation_steps):
         with ctx:
-            loss = model(input_ids=X, labels=Y, use_cache=False).loss
+            loss = model(input_ids=X, labels=X, use_cache=False).loss
             loss = loss / gradient_accumulation_steps # scale the loss to account for gradient accumulation
         # immediately async prefetch next batch while model is doing the forward pass on the GPU
         loss.backward()
-        X, Y = get_batch('train')
+        X = get_batch('train')
 
     # step the optimizer
     if not cramming_fuse_optim_backward: # not needed for optimizer fused into backward pass
