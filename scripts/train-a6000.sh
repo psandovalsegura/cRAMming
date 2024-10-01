@@ -9,6 +9,7 @@
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=60G
 #SBATCH --output=slurm-%j-%x.out
+#SBATCH --signal=B:USR1@120
 #SBATCH --mail-type=end          
 #SBATCH --mail-type=fail         
 #SBATCH --mail-user=psando@umd.edu
@@ -25,7 +26,7 @@
 # For gradient accumulation, it is necessary to turn off 
 # gradient offloading to CPU
 export TOKENIZERS_PARALLELISM=true
-python train.py config/train_llama-2-7b.py \
+exec python train.py config/train_llama-2-7b_owt.py \
                 --out_dir="/fs/nexus-scratch/psando/nanoGPT-experiments/out-cRAMming-a6000" \
                 --gradient_accumulation_steps=40 \
                 --cramming_offload_gradients_cpu=False \

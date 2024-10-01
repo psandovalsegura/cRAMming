@@ -187,7 +187,9 @@ def configure_fused_optimizers(model, weight_decay, learning_rate, betas, device
     return optimizer_dict
 
 def save_checkpoint_on_signal(signum, frame):
-    # save a checkpoint on SIGTERM (e.g. from slurm) or SIGINT (e.g. ctrl-c)
+    # save a checkpoint on SIGTERM or SIGUSR1 (e.g. from slurm sbatch)
+    signal_name = {signal.SIGTERM: 'SIGTERM', signal.SIGUSR1: 'SIGUSR1 (BEFORE TIME LIMIT)'}[signum]
+    print(f"Received {signal_name}, saving checkpoint to {ckpt_file}")
     checkpoint = {
         'model': raw_model.state_dict(),
         'optimizer': optimizer.state_dict(),
@@ -197,13 +199,11 @@ def save_checkpoint_on_signal(signum, frame):
         'config': config,
     }
     ckpt_file = os.path.join(out_dir, f'signal_ckpt_iter_{iter_num}.pt')
-    signal_name = {signal.SIGTERM: 'SIGTERM', signal.SIGINT: 'SIGINT'}[signum]
-    print(f"Received {signal_name}, saving checkpoint to {ckpt_file}")
     torch.save(checkpoint, ckpt_file)
     sys.exit(0)
 
 signal.signal(signal.SIGTERM, save_checkpoint_on_signal)
-signal.signal(signal.SIGINT, save_checkpoint_on_signal)
+signal.signal(signal.SIGUSR1, save_checkpoint_on_signal)
 
 # -----------------------------------------------------------------------------
 # various inits, derived attributes, I/O setup

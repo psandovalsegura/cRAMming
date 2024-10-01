@@ -8,7 +8,7 @@ cache_dir = '/fs/nexus-scratch/psando/huggingface' # where to store huggingface 
 # wandb logging
 wandb_log = True
 wandb_project = 'cRAMming-owt'
-wandb_run_name = f"{model_name.split('/')[-1]}-{init_from}" # 'run' + str(time.time())
+wandb_run_name = 'llama-2-7b-hf'
 
 # data
 data_dir = '/fs/nexus-scratch/psando/owt/llama-owt/'
