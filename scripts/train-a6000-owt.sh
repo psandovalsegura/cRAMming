@@ -7,7 +7,7 @@
 #SBATCH --ntasks=1
 #SBATCH --gres=gpu:rtxa6000:1
 #SBATCH --cpus-per-task=4
-#SBATCH --mem=60G
+#SBATCH --mem=64G
 #SBATCH --output=slurm-%j-%x.out
 #SBATCH --signal=B:USR1@120
 #SBATCH --mail-type=end          
@@ -31,4 +31,5 @@ exec python train.py config/train_llama-2-7b_owt.py \
                 --gradient_accumulation_steps=40 \
                 --cramming_offload_gradients_cpu=False \
                 --eval_interval=25 \
-                --log_interval=25 
+                --log_interval=25 \
+                --init_from="resume"

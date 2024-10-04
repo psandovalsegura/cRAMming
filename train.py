@@ -265,16 +265,16 @@ best_val_loss = 1e9
 # model init
 if init_from == 'resume':
     # resume training from latest checkpoint
-    ckpt_file = max([f for f in os.listdir(out_dir) if f.startswith('ckpt_iter_')], key=lambda x: int(x.split('_')[-1].split('.')[0]))
+    ckpt_file = max([f for f in os.listdir(out_dir) if f.startswith('signal_ckpt_iter_')], key=lambda x: int(x.split('_')[-1].split('.')[0]))
     ckpt_path = os.path.join(out_dir, ckpt_file)
-    checkpoint = torch.load(ckpt_path, map_location='cpu')
+    checkpoint = torch.load(ckpt_path)
     checkpoint_model_args, iter_num, best_val_loss = checkpoint['model_args'], checkpoint['iter_num'], checkpoint['best_val_loss']
     print(f"Resuming training from checkpoint:\n\tPath:{ckpt_path}\n\tIter:{iter_num}\n\tBest val loss:{best_val_loss}\n\tModel args:{checkpoint_model_args}")
-    # create the model
-    model = liger_kernel_for_causal_lm(**checkpoint_model_args)
-    state_dict = checkpoint['model']
-    model.load_state_dict(state_dict)
-    # free model state dict cpu memory
+    # create the model on GPU, so there is CPU memory available for optimizer state init
+    with torch.device(device):
+        model = liger_kernel_for_causal_lm(**checkpoint_model_args)
+    model.load_state_dict(checkpoint['model'])
+    # free model state dict GPU memory
     del checkpoint['model']
 elif init_from in ['pretrained', 'scratch']:
     model = liger_kernel_for_causal_lm(init_from, model_name, cache_dir)
