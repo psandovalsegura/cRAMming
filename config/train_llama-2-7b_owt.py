@@ -8,21 +8,20 @@ cache_dir = '/fs/nexus-scratch/psando/huggingface' # where to store huggingface 
 # wandb logging
 wandb_log = True
 wandb_project = 'cRAMming-owt'
-wandb_run_name = 'llama-2-7b-hf'
+wandb_run_name = 'llama-2-7b'
 
 # data
 data_dir = '/fs/nexus-scratch/psando/owt/llama-owt/'
 
-# these make the total batch size be ~0.5M
-# 12 batch size * 1024 block size * 5 gradaccum * 8 GPUs = 491,520
-# 12 batch size * 1024 block size * 5 gradaccum * 1 GPU = 61,440
+# these make the total batch size be ~0.2M
+# 1 batch size * 4096 block size * 40 gradaccum = 163,840
 batch_size = 1
 block_size = 4096
 gradient_accumulation_steps = 1
 
-# this makes total number of tokens be 300B
-max_iters = 600000
-lr_decay_iters = 600000
+# this makes total number of tokens be 1B if gradient accumulation is 40
+max_iters = 6100
+lr_decay_iters = 6100
 
 # eval stuff
 eval_interval = 1000  # number of train steps after which to log train/val loss to wandb
