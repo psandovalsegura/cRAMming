@@ -194,7 +194,7 @@ def save_checkpoint_on_signal(signum, frame):
     checkpoint = {
         'model': raw_model.state_dict(),
         'optimizer': optimizer.state_dict(),
-        'model_args': dict(init_from=init_from, model_name=model_name, cache_dir=cache_dir),
+        'model_args': dict(model_name=model_name, cache_dir=cache_dir),
         'iter_num': iter_num,
         'best_val_loss': best_val_loss,
         'config': config,
@@ -272,7 +272,8 @@ if init_from == 'resume':
     print(f"Resuming training from checkpoint:\n\tPath:{ckpt_path}\n\tIter:{iter_num}\n\tBest val loss:{best_val_loss}\n\tModel args:{checkpoint_model_args}")
     # create the model on GPU, so there is CPU memory available for optimizer state init
     with torch.device(device):
-        model = liger_kernel_for_causal_lm(**checkpoint_model_args)
+        # temporarily create model from pretrained bc it is faster then load the state dict
+        model = liger_kernel_for_causal_lm(init_from='pretrained', **checkpoint_model_args)
     model.load_state_dict(checkpoint['model'])
     # free model state dict GPU memory
     del checkpoint['model']
@@ -362,7 +363,6 @@ X = get_batch('train') # fetch the very first batch
 t0 = time.time()
 local_iter_num = 0 # number of iterations in the lifetime of this process
 raw_model = model.module if ddp else model # unwrap DDP container if needed
-running_mfu = -1.0
 while True:
 
     # determine and set the learning rate for this iteration
@@ -386,7 +386,7 @@ while True:
                 "train_loss": eval_out['train'],
                 "val_loss": eval_out['val'],
                 "lr": lr,
-                "mfu": running_mfu*100, # convert to percentage
+                "tokens_seen": iter_num * tokens_per_iter / 1e6,  # tokens seen in millions
                 "text_sample": eval_out['text'],
             })
         if eval_out['val'] < best_val_loss:
@@ -395,7 +395,7 @@ while True:
                 checkpoint = {
                     'model': raw_model.state_dict(),
                     'optimizer': optimizer.state_dict(),
-                    'model_args': dict(init_from=init_from, model_name=model_name, cache_dir=cache_dir),
+                    'model_args': dict(model_name=model_name, cache_dir=cache_dir),
                     'iter_num': iter_num,
                     'best_val_loss': best_val_loss,
                     'config': config,
