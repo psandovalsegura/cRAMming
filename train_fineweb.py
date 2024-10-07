@@ -32,6 +32,7 @@ from torch.distributed import init_process_group, destroy_process_group
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 from liger_kernel.transformers.monkey_patch import _apply_liger_kernel, MODEL_TYPE_TO_APPLY_LIGER_FN
 from torchao.prototype.low_bit_optim import CPUOffloadOptimizer
+from fineweb_dataloader import DistributedDataLoader
 
 import functools
 from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
@@ -194,6 +195,7 @@ def save_checkpoint_on_signal(signum, frame):
     checkpoint = {
         'model': raw_model.state_dict(),
         'optimizer': optimizer.state_dict(),
+        'train_loader': train_loader.state_dict(),
         'model_args': dict(model_name=model_name, cache_dir=cache_dir),
         'iter_num': iter_num,
         'best_val_loss': best_val_loss,
@@ -241,22 +243,21 @@ ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torc
 ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
 torch.set_default_dtype(ptdtype)
 
-# poor man's data loader
+# dataloader setup
+train_filename_pattern = os.path.join(data_dir, "fineweb_train_*.bin")
+val_filename_pattern = os.path.join(data_dir, "fineweb_val_*.bin")
+train_loader = DistributedDataLoader(filename_pattern=train_filename_pattern, B=batch_size, T=block_size, 
+                                     process_rank=0, num_processes=1)
+val_loader = DistributedDataLoader(filename_pattern=val_filename_pattern, B=batch_size, T=block_size,
+                                   process_rank=0, num_processes=1)
+
+print(f"Training DataLoader: total number of tokens: {train_loader.ntok_total} across {len(train_loader.files)} files")
+print(f"Validation DataLoader: total number of tokens: {val_loader.ntok_total} across {len(val_loader.files)} files")
+
 def get_batch(split):
-    # We recreate np.memmap every batch to avoid a memory leak, as per
-    # https://stackoverflow.com/questions/45132940/numpy-memmap-memory-usage-want-to-iterate-once/61472122#61472122
-    if split == 'train':
-        data = np.memmap(os.path.join(data_dir, 'train.bin'), dtype=np.uint16, mode='r')
-    else:
-        data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint16, mode='r')
-    ix = torch.randint(len(data) - block_size, (batch_size,))
-    x = torch.stack([torch.from_numpy((data[i:i+block_size]).astype(np.int64)) for i in ix])
-    if device_type == 'cuda':
-        # pin arrays x,y, which allows us to move them to GPU asynchronously (non_blocking=True)
-        x = x.pin_memory().to(device, non_blocking=True)
-    else:
-        x = x.to(device)
-    return x
+    assert split in ['train', 'val'], f"Unknown split: {split}"
+    loader = train_loader if split == 'train' else val_loader
+    return loader.next_batch()
 
 # init these up here, can override if init_from='resume' (i.e. from a checkpoint)
 iter_num = 0
@@ -304,6 +305,7 @@ if init_from == 'resume':
     optimizer.load_state_dict(checkpoint['optimizer'])
     # free optimizer state dict cpu memory
     del checkpoint['optimizer']
+    train_loader.load_state_dict(checkpoint['train_loader'])
 checkpoint = None # free up memory
 
 # compile the model
@@ -395,6 +397,7 @@ while True:
                 checkpoint = {
                     'model': raw_model.state_dict(),
                     'optimizer': optimizer.state_dict(),
+                    'train_loader': train_loader.state_dict(),
                     'model_args': dict(model_name=model_name, cache_dir=cache_dir),
                     'iter_num': iter_num,
                     'best_val_loss': best_val_loss,
