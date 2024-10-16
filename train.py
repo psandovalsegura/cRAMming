@@ -26,12 +26,14 @@ from contextlib import nullcontext
 
 import numpy as np
 import torch
-from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
 
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 from liger_kernel.transformers.monkey_patch import _apply_liger_kernel, MODEL_TYPE_TO_APPLY_LIGER_FN
 from torchao.prototype.low_bit_optim import CPUOffloadOptimizer
+
+from axonn import axonn as ax
+from axonn.intra_layer import auto_parallelize, sync_gradients
 
 import functools
 from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
@@ -123,9 +125,11 @@ def liger_kernel_for_causal_lm(init_from, model_name, cache_dir, **kwargs):
     }
         
     if init_from == "pretrained":
-        model = AutoModelForCausalLM.from_pretrained(model_name, cache_dir=cache_dir, **applicable_kwargs)
+        with auto_parallelize():
+            model = AutoModelForCausalLM.from_pretrained(model_name, cache_dir=cache_dir, **applicable_kwargs)
     elif init_from == "scratch":
-        model = AutoModelForCausalLM.from_config(model_config, **applicable_kwargs)
+        with auto_parallelize():
+            model = AutoModelForCausalLM.from_config(model_config, **applicable_kwargs)
     else:
         raise ValueError(f"Invalid init_from value: {init_from}")
     return model
@@ -221,6 +225,11 @@ if ddp:
     # down the desired gradient accumulation iterations per process proportionally
     assert gradient_accumulation_steps % ddp_world_size == 0
     gradient_accumulation_steps //= ddp_world_size
+    ax.init(
+        G_intra_r=1,
+        G_intra_c=1,
+        G_intra_d=1,
+    )
 else:
     # if not ddp, we are running on a single gpu, and one process
     master_process = True
@@ -311,10 +320,6 @@ if compile:
     print("compiling the model... (takes a ~minute)")
     unoptimized_model = model
     model = torch.compile(model) # requires PyTorch 2.0
-
-# wrap model into DDP container
-if ddp:
-    model = DDP(model, device_ids=[ddp_local_rank])
 
 # helps estimate an arbitrarily accurate loss over either split using many batches
 @torch.no_grad()
@@ -413,6 +418,7 @@ while True:
             loss = loss / gradient_accumulation_steps # scale the loss to account for gradient accumulation
         # immediately async prefetch next batch while model is doing the forward pass on the GPU
         loss.backward()
+        sync_gradients(model)
         X = get_batch('train')
 
     # step the optimizer
