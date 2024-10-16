@@ -226,7 +226,6 @@ if ddp:
     assert gradient_accumulation_steps % ddp_world_size == 0
     gradient_accumulation_steps //= ddp_world_size
     ax.init(
-        G_data=1,
         G_intra_r=1,
         G_intra_c=1,
         G_intra_d=1,
