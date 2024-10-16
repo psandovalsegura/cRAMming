@@ -418,6 +418,7 @@ while True:
             loss = loss / gradient_accumulation_steps # scale the loss to account for gradient accumulation
         # immediately async prefetch next batch while model is doing the forward pass on the GPU
         loss.backward()
+        sync_gradients(model)
         X = get_batch('train')
 
     # step the optimizer
