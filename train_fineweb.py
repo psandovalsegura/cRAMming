@@ -34,6 +34,8 @@ from liger_kernel.transformers.monkey_patch import _apply_liger_kernel, MODEL_TY
 from torchao.prototype.low_bit_optim import CPUOffloadOptimizer
 from fineweb_dataloader import DistributedDataLoader
 
+import slimadamw
+
 import functools
 from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
         checkpoint_wrapper,
@@ -97,6 +99,7 @@ cramming_offload_optim_cpu = True
 cramming_offload_gradients_cpu = True
 cramming_activation_checkpointing = True
 cramming_fuse_optim_backward = False
+cramming_use_slimadamw = False
 using_preemptible = False # whether running on a preemptible instance
 # -----------------------------------------------------------------------------
 config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
@@ -155,8 +158,16 @@ def configure_optimizers(model, weight_decay, learning_rate, betas, device_type)
         optimizer = CPUOffloadOptimizer(optim_groups, torch.optim.AdamW, offload_gradients=cramming_offload_gradients_cpu, fused=use_fused, lr=learning_rate, betas=betas)
         print("Using CPU Offload Optimizer")
     else:
-        optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas, fused=use_fused)
-        print("Using PyTorch AdamW Optimizer")
+        if cramming_use_slimadamw:
+            ''' 
+            1. SlimAdamW doesn't support fusing yet
+            2. SlimAdamW requires `model` as second argument: SlimAdamW(model.parameters(), model, ...)
+            '''
+            optimizer = slimadamw.SlimAdamW(optim_groups, model, lr=learning_rate, betas=betas) 
+            print("Using SlimAdamW Optimizer")
+        else:
+            optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas, fused=use_fused)
+            print("Using PyTorch AdamW Optimizer")
     return optimizer
 
 def configure_fused_optimizers(model, weight_decay, learning_rate, betas, device_type):
