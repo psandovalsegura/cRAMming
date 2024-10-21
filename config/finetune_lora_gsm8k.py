@@ -8,7 +8,7 @@ cache_dir = '/fs/nexus-scratch/psando/huggingface' # where to store huggingface 
 # wandb logging
 wandb_log = True
 wandb_project = 'finetune-gsm8k'
-wandb_run_name = 'full'
+wandb_run_name = 'lora'
 
 batch_size = 1
 block_size = 1024
@@ -16,8 +16,8 @@ gradient_accumulation_steps = 1
 
 # Num samples in train: 7473
 # Num samples in test: 1319
-learning_rate = 3e-5
-min_lr = 3e-6
+learning_rate = 1e-4
+min_lr = 1e-6
 warmup_iters = 20
 max_iters = 1868 # 1 epoch (max_iters=1868) or 2 epoch (max_iters=3736)
 
