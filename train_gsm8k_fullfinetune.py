@@ -279,19 +279,25 @@ tokenizer = AutoTokenizer.from_pretrained(model_name, cache_dir=cache_dir)
 # dataloader setup
 train_loader = get_dataloader(tokenizer, batch_size, split='train', shuffle=True, max_seq_len=block_size)
 val_loader = get_dataloader(tokenizer, batch_size, split='test', shuffle=False, max_seq_len=block_size)
+train_iterator = iter(train_loader)
 
-eval_prompt_input_ids = val_loader.dataset[0]['input_ids']
-eval_prompt_attention_mask = val_loader.dataset[0]['attention_mask']
-generation_max_len = 124
+# use first validation example as eval prompt
+# modify input_ids to only include the question
+response_begin_idx = np.where(val_loader.dataset[0]['labels'] != -100)[0][0]
+eval_prompt_input_ids = val_loader.dataset[0]['input_ids'][:response_begin_idx].unsqueeze(0)
+max_new_tokens = 124
+
+def move_batch_to_device(batch, device):
+    # ensure all tensors are on the device
+    for k, v in batch.items():
+        if isinstance(v, torch.Tensor):
+            batch[k] = v.to(device)
+    return batch
 
 def get_batch(split):
-    assert split in ['train', 'val'], f"Unknown split: {split}"
-    loader = train_loader if split == 'train' else val_loader
-    batch = loader.next_batch()
-    # ensure all tensors are on the device
-    for v in batch.values():
-        if isinstance(v, torch.Tensor):
-            v = v.to(device)
+    assert split in ['train'], f"Unsupported split for training: {split}"
+    batch = next(train_iterator)
+    batch = move_batch_to_device(batch, device)
     return batch
 
 # optimizer
@@ -320,10 +326,12 @@ if ddp:
 def estimate_loss_and_generate():
     out = {}
     model.eval()
+    new_iterators = {'train': iter(train_loader), 'val': iter(val_loader)}
     for split in ['train', 'val']:
         losses = torch.zeros(eval_iters)
         for k in range(eval_iters):
-            B = get_batch(split)
+            B = next(new_iterators[split])
+            B = move_batch_to_device(B, device)
             with ctx:
                 loss = model(**B, use_cache=False).loss
             losses[k] = loss.item()
@@ -331,9 +339,8 @@ def estimate_loss_and_generate():
     
     # generate some text
     outputs = model.generate(eval_prompt_input_ids.to(device), 
-                             max_length=generation_max_len, 
-                             do_sample=True, temperature=0.7,
-                             attention_mask=eval_prompt_attention_mask.to(device))
+                             max_new_tokens=max_new_tokens, 
+                             do_sample=True, temperature=0.7)
     out['text'] = tokenizer.decode(outputs[0], skip_special_tokens=True)
     model.train()
     return out
