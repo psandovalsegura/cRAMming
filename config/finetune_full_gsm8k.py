@@ -19,7 +19,7 @@ gradient_accumulation_steps = 1
 learning_rate = 3e-5
 min_lr = 3e-6
 warmup_iters = 20
-max_iters = 1868 # (7473 // batch_size) * 2
+max_iters = 1868 # 1 epoch (max_iters=1868) or 2 epoch (max_iters=3736)
 
 # eval stuff
 eval_interval = 10    # number of train steps after which to log train/val loss to wandb

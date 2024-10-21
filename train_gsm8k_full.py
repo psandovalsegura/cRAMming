@@ -286,6 +286,7 @@ train_iterator = iter(train_loader)
 response_begin_idx = np.where(val_loader.dataset[0]['labels'] != -100)[0][0]
 eval_prompt_input_ids = val_loader.dataset[0]['input_ids'][:response_begin_idx].unsqueeze(0)
 max_new_tokens = 124
+print(f"During evaluation, model will generate up to {max_new_tokens} tokens from the following prompt:\n{tokenizer.decode(eval_prompt_input_ids[0])}")
 
 def move_batch_to_device(batch, device):
     # ensure all tensors are on the device
@@ -444,6 +445,7 @@ while True:
 
     # termination conditions
     if iter_num > max_iters:
+        save_checkpoint_on_signal(signal.SIGUSR1, None) # save a checkpoint before exiting
         break
 
 if ddp:
