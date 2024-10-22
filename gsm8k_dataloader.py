@@ -49,4 +49,9 @@ class GSM8KDataset(torch.utils.data.Dataset):
         
 def get_dataloader(tokenizer, batch_size, split, shuffle, max_seq_len=1024, num_workers=4):
     dataset = GSM8KDataset(tokenizer, split=split, max_seq_len=max_seq_len)
-    return torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=shuffle, num_workers=num_workers)
+    return torch.utils.data.DataLoader(dataset, 
+                                       batch_size=batch_size, 
+                                       shuffle=shuffle, 
+                                       num_workers=num_workers, 
+                                       pin_memory=True, 
+                                       drop_last=True)

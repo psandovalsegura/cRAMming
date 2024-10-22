@@ -4,11 +4,12 @@
 model_name = 'meta-llama/Llama-2-7b-hf'            # huggingface model name
 init_from = 'pretrained'                           # 'resume', 'scratch', or 'pretrained'
 cache_dir = '/fs/nexus-scratch/psando/huggingface' # where to store huggingface weights
+qlora = True
 
 # wandb logging
 wandb_log = True
 wandb_project = 'finetune-gsm8k'
-wandb_run_name = 'lora'
+wandb_run_name = 'qlora'
 
 batch_size = 4
 block_size = 1024

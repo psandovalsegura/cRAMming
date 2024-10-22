@@ -10,16 +10,18 @@ wandb_log = True
 wandb_project = 'finetune-gsm8k'
 wandb_run_name = 'full'
 
-batch_size = 1
+batch_size = 4
 block_size = 1024
 gradient_accumulation_steps = 1
 
 # Num samples in train: 7473
 # Num samples in test: 1319
+# Train tokens per sample: Min: 81, Max: 585, Avg: 210.39288103840494
+# Test tokens per sample: Min: 85, Max: 584, Avg: 214.25473843821078
 learning_rate = 3e-5
-min_lr = 3e-6
+min_lr = 1e-6
 warmup_iters = 20
-max_iters = 1868 # 1 epoch (max_iters=1868) or 2 epoch (max_iters=3736)
+epochs = 2
 
 # eval stuff
 eval_interval = 10    # number of train steps after which to log train/val loss to wandb

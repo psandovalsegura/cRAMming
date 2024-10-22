@@ -77,7 +77,7 @@ batch_size = 1
 block_size = 4096
 # adamw optimizer
 learning_rate = 3e-4 # max learning rate
-max_iters = 600000 # total number of training iterations
+epochs = 2
 weight_decay = 1e-1
 beta1 = 0.9
 beta2 = 0.95
@@ -94,8 +94,6 @@ compile = False # use PyTorch 2.0 to compile the model to be faster
 cramming_offload_optim_cpu = True
 cramming_offload_gradients_cpu = True
 cramming_activation_checkpointing = True
-cramming_fuse_optim_backward = False
-using_preemptible = False # whether running on a preemptible instance
 # -----------------------------------------------------------------------------
 config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
 exec(open('configurator.py').read()) # overrides from command line or config file
@@ -157,41 +155,12 @@ def configure_optimizers(model, weight_decay, learning_rate, betas, device_type)
         print("Using PyTorch AdamW Optimizer")
     return optimizer
 
-def configure_fused_optimizers(model, weight_decay, learning_rate, betas, device_type):
-    print("=> Using optimizer fused into backward pass")
-    fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
-    use_fused = fused_available and device_type == 'cuda'
-    # Any parameters that is 2D will be weight decayed, otherwise no.
-    # i.e. all weight tensors in matmuls + embeddings decay, all biases and layernorms don't.
-    optimizer_dict = dict()
-    for pn, p in model.named_parameters():
-        if p.requires_grad:
-            if p.dim() >= 2:
-                # use weight decay
-                if cramming_offload_optim_cpu:
-                    optimizer_dict[p] = CPUOffloadOptimizer([p], torch.optim.AdamW, offload_gradients=cramming_offload_gradients_cpu, fused=use_fused, lr=learning_rate, betas=betas, weight_decay=weight_decay)
-                else:
-                    optimizer_dict[p] = torch.optim.AdamW([p], lr=learning_rate, betas=betas, weight_decay=weight_decay, fused=use_fused)
-            else:
-                # no weight decay
-                if cramming_offload_optim_cpu:
-                    optimizer_dict[p] = CPUOffloadOptimizer([p], torch.optim.AdamW, offload_gradients=cramming_offload_gradients_cpu, fused=use_fused, lr=learning_rate, betas=betas, weight_decay=0.0)
-                else:
-                    optimizer_dict[p] = torch.optim.AdamW([p], lr=learning_rate, betas=betas, weight_decay=0.0, fused=use_fused)
-    def optimizer_hook(parameter):
-        optimizer_dict[parameter].step()
-        optimizer_dict[parameter].zero_grad()
-    for p in model.parameters():
-        p.register_post_accumulate_grad_hook(optimizer_hook)
-    return optimizer_dict
-
 def save_checkpoint_on_signal(signum, frame):
     # save a checkpoint on SIGTERM or SIGUSR1 (e.g. from slurm sbatch)
     signal_name = {signal.SIGTERM: 'SIGTERM', signal.SIGUSR1: 'SIGUSR1 (BEFORE TIME LIMIT)'}[signum]
     ckpt_file = os.path.join(out_dir, f'signal_ckpt_iter_{iter_num}.pt')
     print(f"Received {signal_name}, saving checkpoint to {ckpt_file}")
     checkpoint = {
-        'optimizer': optimizer.state_dict(),
         'model_args': dict(model_name=model_name, cache_dir=cache_dir),
         'iter_num': iter_num,
         'best_val_loss': best_val_loss,
@@ -230,6 +199,8 @@ else:
 tokens_per_iter = gradient_accumulation_steps * ddp_world_size * batch_size * block_size
 print(f"Tokens per iteration: {tokens_per_iter:,}")
 print(f"Tokens per wandb step: {tokens_per_iter * eval_interval:,}")
+samples_per_iter = gradient_accumulation_steps * ddp_world_size * batch_size
+print(f"Samples per iteration: {samples_per_iter}")
 
 if master_process:
     os.makedirs(out_dir, exist_ok=True)
@@ -280,6 +251,7 @@ tokenizer = AutoTokenizer.from_pretrained(model_name, cache_dir=cache_dir)
 train_loader = get_dataloader(tokenizer, batch_size, split='train', shuffle=True, max_seq_len=block_size)
 val_loader = get_dataloader(tokenizer, batch_size, split='test', shuffle=False, max_seq_len=block_size)
 train_iterator = iter(train_loader)
+max_iters = len(train_loader) * epochs
 
 # use first validation example as eval prompt
 # modify input_ids to only include the question
@@ -289,23 +261,11 @@ max_new_tokens = 124
 print(f"During evaluation, model will generate up to {max_new_tokens} tokens from the following prompt:\n{tokenizer.decode(eval_prompt_input_ids[0])}")
 
 def move_batch_to_device(batch, device):
-    # ensure all tensors are on the device
-    for k, v in batch.items():
-        if isinstance(v, torch.Tensor):
-            batch[k] = v.to(device)
-    return batch
-
-def get_batch(split):
-    assert split in ['train'], f"Unsupported split for training: {split}"
-    batch = next(train_iterator)
-    batch = move_batch_to_device(batch, device)
+    batch = {k: v.to(device) for k, v in batch.items()}
     return batch
 
 # optimizer
-if cramming_fuse_optim_backward:
-    optimizer_dict = configure_fused_optimizers(model, weight_decay, learning_rate, (beta1, beta2), device_type)
-else:
-    optimizer = configure_optimizers(model, weight_decay, learning_rate, (beta1, beta2), device_type)
+optimizer = configure_optimizers(model, weight_decay, learning_rate, (beta1, beta2), device_type)
 if init_from == 'resume':
     optimizer.load_state_dict(checkpoint['optimizer'])
     # free optimizer state dict cpu memory
@@ -327,11 +287,11 @@ if ddp:
 def estimate_loss_and_generate():
     out = {}
     model.eval()
-    new_iterators = {'train': iter(train_loader), 'val': iter(val_loader)}
+    estimate_iterators = {'train': iter(train_loader), 'val': iter(val_loader)}
     for split in ['train', 'val']:
         losses = torch.zeros(eval_iters)
         for k in range(eval_iters):
-            B = next(new_iterators[split])
+            B = next(estimate_iterators[split])
             B = move_batch_to_device(B, device)
             with ctx:
                 loss = model(**B, use_cache=False).loss
@@ -357,12 +317,13 @@ def get_lr(it):
 # logging
 if wandb_log and master_process:
     import wandb
-    # add tokens_per_wandb_step to config for easy reference in wandb
-    config['tokens_per_wandb_step'] = tokens_per_iter * eval_interval
+    # add samples_per_wandb_step to config for easy reference in wandb
+    config['max_iters'] = max_iters
+    config['samples_per_wandb_step'] = samples_per_iter * eval_interval
     wandb.init(project=wandb_project, name=wandb_run_name, config=config)
 
 # training loop
-B = get_batch('train') # fetch the very first batch
+B = move_batch_to_device(next(train_iterator), device)
 t0 = time.time()
 local_iter_num = 0 # number of iterations in the lifetime of this process
 raw_model = model.module if ddp else model # unwrap DDP container if needed
@@ -370,13 +331,8 @@ while True:
 
     # determine and set the learning rate for this iteration
     lr = get_lr(iter_num) if decay_lr else learning_rate
-    if cramming_fuse_optim_backward:
-        for suboptimizer in optimizer_dict.values():
-            for param_group in suboptimizer.param_groups:
-                param_group['lr'] = lr
-    else:
-        for param_group in optimizer.param_groups:
-            param_group['lr'] = lr
+    for param_group in optimizer.param_groups:
+        param_group['lr'] = lr
 
     # evaluate the loss on train/val sets and write checkpoints
     if iter_num % eval_interval == 0 and master_process:
@@ -389,14 +345,13 @@ while True:
                 "train_loss": eval_out['train'],
                 "val_loss": eval_out['val'],
                 "lr": lr,
-                "tokens_seen": iter_num * tokens_per_iter / 1e6,  # tokens seen in millions
+                "samples_seen": iter_num * samples_per_iter,
                 "text_sample": eval_out['text'],
             })
         if eval_out['val'] < best_val_loss:
             best_val_loss = eval_out['val']
             if iter_num > 0 and save_checkpoints:
                 checkpoint = {
-                    'optimizer': optimizer.state_dict(),
                     'model_args': dict(model_name=model_name, cache_dir=cache_dir),
                     'iter_num': iter_num,
                     'best_val_loss': best_val_loss,
@@ -406,7 +361,7 @@ while True:
                 ckpt_model_subdir = os.path.join(out_dir, f'ckpt_iter_{iter_num}_model')
                 os.makedirs(ckpt_model_subdir, exist_ok=True)
                 raw_model.save_pretrained(ckpt_model_subdir)
-                print(f"saving checkpoint to {ckpt_file} and model to {ckpt_model_subdir}")
+                print(f"saving checkpoint to {ckpt_model_subdir}")
                 torch.save(checkpoint, ckpt_file)
     if iter_num == 0 and eval_only:
         break
@@ -418,13 +373,16 @@ while True:
             loss = loss / gradient_accumulation_steps # scale the loss to account for gradient accumulation
         # immediately async prefetch next batch while model is doing the forward pass on the GPU
         loss.backward()
-        B = get_batch('train')
+        try:
+            B = move_batch_to_device(next(train_iterator), device)
+        except StopIteration:
+            train_iterator = iter(train_loader)
+            B = move_batch_to_device(next(train_iterator), device)
 
     # step the optimizer
-    if not cramming_fuse_optim_backward: # not needed for optimizer fused into backward pass
-        optimizer.step()
-        # flush the gradients as soon as we can, no need for this memory anymore
-        optimizer.zero_grad(set_to_none=True)
+    optimizer.step()
+    # flush the gradients as soon as we can, no need for this memory anymore
+    optimizer.zero_grad(set_to_none=True)
 
     # timing and logging
     t1 = time.time()
