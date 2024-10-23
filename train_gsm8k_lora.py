@@ -72,6 +72,7 @@ cache_dir = 'cache' # where to store huggingface weights
 wandb_log = False # disabled by default
 wandb_project = 'cRAMming'
 wandb_run_name = f"{model_name.split('/')[-1]}-{init_from}" # 'run' + str(time.time())
+wandb_generate_text = False # whether to generate text during logging
 # data
 gradient_accumulation_steps = 5 * 8 # used to simulate larger batch sizes
 batch_size = 1 
@@ -89,6 +90,7 @@ min_lr = 3e-5 # minimum learning rate, should be ~= learning_rate/10 per Chinchi
 # DDP settings
 backend = 'nccl' # 'nccl', 'gloo', etc.
 # system
+num_workers = 4 # number of dataloader workers
 device = 'cuda' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
 dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16' # 'float32', 'bfloat16', or 'float16', the latter will auto implement a GradScaler
 compile = False # use PyTorch 2.0 to compile the model to be faster
@@ -226,7 +228,7 @@ print(f"Tokens per wandb step: {tokens_per_iter * eval_interval:,}")
 samples_per_iter = gradient_accumulation_steps * ddp_world_size * batch_size
 print(f"Samples per iteration: {samples_per_iter}")
 
-if master_process:
+if master_process and wandb_log:
     os.makedirs(out_dir, exist_ok=True)
 torch.manual_seed(1337 + seed_offset)
 torch.backends.cuda.matmul.allow_tf32 = True # allow tf32 on matmul
@@ -278,20 +280,21 @@ model.to(device)
 tokenizer = AutoTokenizer.from_pretrained(model_name, cache_dir=cache_dir)
 
 # dataloader setup
-train_loader = get_dataloader(tokenizer, batch_size, split='train', shuffle=True, max_seq_len=block_size)
-val_loader = get_dataloader(tokenizer, batch_size, split='test', shuffle=False, max_seq_len=block_size)
+train_loader = get_dataloader(tokenizer, batch_size, split='train', shuffle=True, max_seq_len=block_size, num_workers=num_workers)
+val_loader = get_dataloader(tokenizer, batch_size, split='test', shuffle=False, max_seq_len=block_size, num_workers=num_workers)
 train_iterator = iter(train_loader)
 max_iters = len(train_loader) * epochs
 
 # use first validation example as eval prompt
 # modify input_ids to only include the question
-response_begin_idx = np.where(val_loader.dataset[0]['labels'] != -100)[0][0]
-eval_prompt_input_ids = val_loader.dataset[0]['input_ids'][:response_begin_idx].unsqueeze(0)
-max_new_tokens = 124
-print(f"During evaluation, model will generate up to {max_new_tokens} tokens from the following prompt:\n{tokenizer.decode(eval_prompt_input_ids[0])}")
+if wandb_generate_text:
+    response_begin_idx = np.where(val_loader.dataset[0]['labels'] != -100)[0][0]
+    eval_prompt_input_ids = val_loader.dataset[0]['input_ids'][:response_begin_idx].unsqueeze(0)
+    max_new_tokens = 64
+    print(f"During evaluation, model will generate up to {max_new_tokens} tokens from the following prompt:\n{tokenizer.decode(eval_prompt_input_ids[0])}")
 
 def move_batch_to_device(batch, device):
-    batch = {k: v.to(device) for k, v in batch.items()}
+    batch = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
     return batch
 
 # optimizer
@@ -329,10 +332,11 @@ def estimate_loss_and_generate():
         out[split] = losses.mean()
     
     # generate some text
-    outputs = model.generate(eval_prompt_input_ids.to(device), 
-                             max_new_tokens=max_new_tokens, 
-                             do_sample=True, temperature=0.7)
-    out['text'] = tokenizer.decode(outputs[0], skip_special_tokens=True)
+    if wandb_generate_text:
+        outputs = model.generate(eval_prompt_input_ids.to(device), 
+                                max_new_tokens=max_new_tokens, 
+                                do_sample=True, temperature=0.7)
+        out['text'] = tokenizer.decode(outputs[0], skip_special_tokens=True)
     model.train()
     return out
 
@@ -354,7 +358,8 @@ if wandb_log and master_process:
 
 # training loop
 B = move_batch_to_device(next(train_iterator), device)
-t0 = time.time()
+# track forward backward step dts
+dts = []
 local_iter_num = 0 # number of iterations in the lifetime of this process
 raw_model = model.module if ddp else model # unwrap DDP container if needed
 while True:
@@ -368,7 +373,7 @@ while True:
     if iter_num % eval_interval == 0 and master_process:
         eval_out = estimate_loss_and_generate()
         print(f"step {iter_num}: train loss {eval_out['train']:.4f}, val loss {eval_out['val']:.4f}")
-        print(f"generated text: {eval_out['text']}")
+        if wandb_generate_text: print(f"generated text: {eval_out['text']}")
         if wandb_log:
             wandb.log({
                 "iter": iter_num,
@@ -376,8 +381,13 @@ while True:
                 "val_loss": eval_out['val'],
                 "lr": lr,
                 "samples_seen": iter_num * samples_per_iter,
-                "text_sample": eval_out['text'],
+                "text_sample": eval_out['text'] if wandb_generate_text else None,
+                "max_memory_allocated": torch.cuda.max_memory_allocated() / 1024**3,
+                "max_memory_reserved": torch.cuda.max_memory_reserved() / 1024**3,
+                "tokens_per_second": tokens_per_iter / np.mean(dts) if len(dts) > 0 else 0,
             })
+            # clear the forward backward step dts
+            dts = []
         if eval_out['val'] < best_val_loss:
             best_val_loss = eval_out['val']
             if iter_num > 0 and save_checkpoints:
@@ -397,6 +407,7 @@ while True:
         break
 
     # forward backward update, with optional gradient accumulation to simulate larger batch size
+    t0 = time.time()
     for micro_step in range(gradient_accumulation_steps):
         with ctx:
             loss = model(**B, use_cache=False).loss
@@ -417,7 +428,7 @@ while True:
     # timing and logging
     t1 = time.time()
     dt = t1 - t0
-    t0 = t1
+    dts.append(dt)
     if iter_num % log_interval == 0 and master_process:
         # get loss as float. note: this is a CPU-GPU sync point
         # scale up to undo the division above, approximating the true total loss (exact would have been a sum)
@@ -427,7 +438,7 @@ while True:
         # if local_iter_num >= 5: # let the training loop settle a bit
         #     mfu = raw_model.estimate_mfu(batch_size * gradient_accumulation_steps, dt)
         #     running_mfu = mfu if running_mfu == -1.0 else 0.9*running_mfu + 0.1*mfu
-        print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%")
+        print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms")
     iter_num += 1
     local_iter_num += 1
 

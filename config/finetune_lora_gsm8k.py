@@ -10,19 +10,23 @@ wandb_log = True
 wandb_project = 'finetune-gsm8k'
 wandb_run_name = 'lora'
 
-batch_size = 4
-block_size = 1024
+batch_size = 8
+block_size = 512
 gradient_accumulation_steps = 1
 
-# Num samples in train: 7473
-# Num samples in test: 1319
+# lora
+lora_rank = 64
+lora_alpha = 128
+lora_dropout = 0.05
+
+# hyperparameters
 learning_rate = 1e-4
-min_lr = 1e-6
+min_lr = 1e-8
 warmup_iters = 20
-max_iters = 1868 # 1 epoch (max_iters=1868) or 2 epoch (max_iters=3736)
+epochs = 2
 
 # eval stuff
-eval_interval = 10    # number of train steps after which to log train/val loss to wandb
+eval_interval = 20    # number of train steps after which to log train/val loss to wandb
 eval_iters = 100      # number of batches to estimate train/val loss
 log_interval = 10     # number of train steps after which to log current train loss to console
 
