@@ -3,13 +3,23 @@ import numpy as np
 from datasets import load_dataset
 
 class GSM8KDataset(torch.utils.data.Dataset):
-    def __init__(self, tokenizer, split='train', max_seq_len=1024):
+    def __init__(self, tokenizer, split='train', max_seq_len=512):
         assert split in ['train', 'test']
         gsm8k = load_dataset(path='gsm8k', name='main')
         self.tokenizer = tokenizer
-        self.split = split
-        self.data = gsm8k[split]
         self.max_seq_len = max_seq_len
+        self.split = split
+        self.data = gsm8k[split].filter(
+            lambda row: self._filter_on_max_seq_len(row, tokenizer, max_seq_len)
+        )
+
+    @staticmethod
+    def _filter_on_max_seq_len(row, tokenizer, max_seq_len):
+        # GSM8K doc_to_text: "Question: {{question}}\nAnswer:"
+        prompt_tokens = tokenizer.encode(f"Question: {row['question']}\nAnswer:", add_special_tokens=True)
+        response_tokens = tokenizer.encode(row['answer'], add_special_tokens=False)
+        response_tokens.append(tokenizer.eos_token_id)
+        return len(prompt_tokens) + len(response_tokens) <= max_seq_len
         
     def __len__(self):
         return len(self.data)
