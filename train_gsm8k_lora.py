@@ -121,8 +121,8 @@ if qlora:
     bnb_config = BitsAndBytesConfig(
         load_in_4bit=True,
         bnb_4bit_quant_type="nf4",
-        bnb_4bit_compute_dtype=torch.float16,
         bnb_4bit_use_double_quant=True,
+        bnb_4bit_compute_dtype=torch.bfloat16,
     ) 
 
 def liger_kernel_for_causal_lm(init_from, model_name, cache_dir, **kwargs):
@@ -236,8 +236,9 @@ torch.backends.cudnn.allow_tf32 = True # allow tf32 on cudnn
 device_type = 'cuda' if 'cuda' in device else 'cpu' # for later use in torch.autocast
 # note: float16 data type will automatically use a GradScaler
 ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torch.float16}[dtype]
-ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
-torch.set_default_dtype(ptdtype)
+ctx = nullcontext() if (device_type == 'cpu' or qlora) else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
+if not qlora:
+    torch.set_default_dtype(ptdtype)
 
 # init these up here, can override if init_from='resume' (i.e. from a checkpoint)
 iter_num = 0
