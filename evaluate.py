@@ -12,17 +12,18 @@ def main():
     parser.add_argument('--num_fewshot', type=int, default=0)
     parser.add_argument('--batch_size', type=int, default=32)
     parser.add_argument('--device', type=str, default='cuda')
+    parser.add_argument('--peft', type=str, default='')
     parser.add_argument('--hf_cache_dir', type=str, default='/fs/nexus-scratch/psando/huggingface')
     parser.add_argument('--output_dir', type=str, default='evaluate_results')
     args = parser.parse_args()
     print(args)
-
-    model = AutoModelForCausalLM.from_pretrained(args.pretrained_model_name_or_path, cache_dir=args.hf_cache_dir).to(args.device)
+    using_peft = len(args.peft) > 0
     tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_name_or_path, cache_dir=args.hf_cache_dir)
-
-    lm_obj = lm_eval.models.huggingface.HFLM(pretrained=model, 
+    lm_obj = lm_eval.models.huggingface.HFLM(pretrained=args.pretrained_model_name_or_path, 
                                              tokenizer=tokenizer, 
-                                             batch_size=args.batch_size)
+                                             batch_size=args.batch_size,
+                                             peft=(args.peft if using_peft else None),
+                                             cache_dir=args.hf_cache_dir)
     results = lm_eval.simple_evaluate(
         model=lm_obj,
         tasks=args.tasks,
@@ -32,7 +33,10 @@ def main():
     
     # Save results in json format
     os.makedirs(args.output_dir, exist_ok=True)
-    results_file = f"results_{args.pretrained_model_name_or_path.split('/')[-2]}.json"
+    if using_peft:
+        results_file = f"results_{args.peft.split('/')[-2]}.json"
+    else:
+        results_file = f"results_{args.pretrained_model_name_or_path.split('/')[-2]}.json"
     with open(os.path.join(args.output_dir, results_file), "w") as f:
         json.dump(results, f, indent=4, default=lm_eval.utils.handle_non_serializable, ensure_ascii=False)
 
