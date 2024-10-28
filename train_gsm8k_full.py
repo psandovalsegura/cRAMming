@@ -22,6 +22,7 @@ import time
 import math
 import signal
 import inspect
+import subprocess
 from contextlib import nullcontext
 
 import numpy as np
@@ -165,7 +166,6 @@ def save_checkpoint_on_signal(signum, frame):
     checkpoint = {
         'model_args': dict(model_name=model_name, cache_dir=cache_dir),
         'iter_num': iter_num,
-        'best_val_loss': best_val_loss,
         'config': config,
     }
     torch.save(checkpoint, ckpt_file)
@@ -217,7 +217,6 @@ torch.set_default_dtype(ptdtype)
 
 # init these up here, can override if init_from='resume' (i.e. from a checkpoint)
 iter_num = 0
-best_val_loss = 1e9
 
 # model init
 if init_from == 'resume':
@@ -225,8 +224,8 @@ if init_from == 'resume':
     ckpt_file = max([f for f in os.listdir(out_dir) if f.startswith('signal_ckpt_iter_')], key=lambda x: int(x.split('_')[-1].split('.')[0]))
     ckpt_path = os.path.join(out_dir, ckpt_file)
     checkpoint = torch.load(ckpt_path)
-    checkpoint_model_args, iter_num, best_val_loss = checkpoint['model_args'], checkpoint['iter_num'], checkpoint['best_val_loss']
-    print(f"Resuming training from checkpoint:\n\tPath:{ckpt_path}\n\tIter:{iter_num}\n\tBest val loss:{best_val_loss}\n\tModel args:{checkpoint_model_args}")
+    checkpoint_model_args, iter_num = checkpoint['model_args'], checkpoint['iter_num']
+    print(f"Resuming training from checkpoint:\n\tPath:{ckpt_path}\n\tIter:{iter_num}\n\tModel args:{checkpoint_model_args}")
     # create the model on GPU, so there is CPU memory available for optimizer state init
     with torch.device(device):
         # temporarily create model from pretrained bc it is faster then load the state dict
@@ -253,7 +252,7 @@ tokenizer = AutoTokenizer.from_pretrained(model_name, cache_dir=cache_dir)
 train_loader = get_dataloader(tokenizer, batch_size, split='train', shuffle=True, max_seq_len=block_size, num_workers=num_workers)
 val_loader = get_dataloader(tokenizer, batch_size, split='test', shuffle=False, max_seq_len=block_size, num_workers=num_workers)
 train_iterator = iter(train_loader)
-max_iters = len(train_loader) * epochs
+max_iters = int(len(train_loader) * epochs)
 
 # use first validation example as eval prompt
 # modify input_ids to only include the question
@@ -290,11 +289,11 @@ if ddp:
 def estimate_loss_and_generate():
     out = {}
     model.eval()
-    estimate_iterators = {'train': iter(train_loader), 'val': iter(val_loader)}
+    estimate_iterator = iter(train_loader)
     for split in ['train', 'val']:
         losses = torch.zeros(eval_iters)
         for k in range(eval_iters):
-            B = next(estimate_iterators[split])
+            B = next(estimate_iterator)
             B = move_batch_to_device(B, device)
             with ctx:
                 loss = model(**B, use_cache=False).loss
@@ -348,7 +347,6 @@ while True:
             wandb.log({
                 "iter": iter_num,
                 "train_loss": eval_out['train'],
-                "val_loss": eval_out['val'],
                 "lr": lr,
                 "samples_seen": iter_num * samples_per_iter,
                 "text_sample": eval_out['text'] if wandb_generate_text else None,
@@ -358,21 +356,14 @@ while True:
             })
             # clear the forward backward step dts
             dts = []
-        if eval_out['val'] < best_val_loss:
-            best_val_loss = eval_out['val']
-            if iter_num > 0 and save_checkpoints:
-                checkpoint = {
-                    'model_args': dict(model_name=model_name, cache_dir=cache_dir),
-                    'iter_num': iter_num,
-                    'best_val_loss': best_val_loss,
-                    'config': config,
-                }
-                ckpt_file = os.path.join(out_dir, f'ckpt_iter_{iter_num}.pt')
-                ckpt_model_subdir = os.path.join(out_dir, f'ckpt_iter_{iter_num}_model')
-                os.makedirs(ckpt_model_subdir, exist_ok=True)
-                raw_model.save_pretrained(ckpt_model_subdir)
-                print(f"saving checkpoint to {ckpt_model_subdir}")
-                torch.save(checkpoint, ckpt_file)
+
+        if iter_num > 0 and save_checkpoints:
+            ckpt_model_subdir = os.path.join(out_dir, f'ckpt_iter_{iter_num}_model')
+            os.makedirs(ckpt_model_subdir, exist_ok=True)
+            raw_model.save_pretrained(ckpt_model_subdir)
+            torch.save(checkpoint, ckpt_file)
+            # submit sbatch job to evaluate this checkpoint
+            subprocess.run(['sbatch', 'scripts/finetuning/evaluate-ckpt.sh', ckpt_model_subdir, str(False)])
     if iter_num == 0 and eval_only:
         break
 
