@@ -86,7 +86,7 @@ beta2 = 0.95
 # learning rate decay settings
 decay_lr = True # whether to decay the learning rate
 warmup_iters = 2000 # how many steps to warm up for
-min_lr = 3e-5 # minimum learning rate, should be ~= learning_rate/10 per Chinchilla
+min_lr = 1e-8 # minimum learning rate, should be ~= learning_rate/10 per Chinchilla
 # DDP settings
 backend = 'nccl' # 'nccl', 'gloo', etc.
 # system
@@ -309,13 +309,13 @@ def estimate_loss_and_generate():
     model.train()
     return out
 
-# learning rate decay scheduler (warmup then linear decay)
+# constant learning rate scheduler (warmup then constant)
 def get_lr(it):
     # 1) linear warmup for warmup_iters steps
     if it < warmup_iters:
-        return learning_rate * it / warmup_iters
-    # 2) linearly decay to min_lr 
-    return max(min_lr, learning_rate * (1 - (it - warmup_iters) / (max_iters - warmup_iters)))
+        return max(min_lr, learning_rate * it / warmup_iters)
+    # 2) constant lr for the rest of the steps
+    return learning_rate
 
 # logging
 if wandb_log and master_process:
@@ -361,7 +361,6 @@ while True:
             ckpt_model_subdir = os.path.join(out_dir, f'ckpt_iter_{iter_num}_model')
             os.makedirs(ckpt_model_subdir, exist_ok=True)
             raw_model.save_pretrained(ckpt_model_subdir)
-            torch.save(checkpoint, ckpt_file)
             # submit sbatch job to evaluate this checkpoint
             subprocess.run(['sbatch', 'scripts/finetuning/evaluate-ckpt.sh', ckpt_model_subdir, str(False)])
     if iter_num == 0 and eval_only:

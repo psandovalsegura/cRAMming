@@ -7,7 +7,7 @@ cache_dir = '/fs/nexus-scratch/psando/huggingface' # where to store huggingface 
 
 # wandb logging
 wandb_log = True
-wandb_project = 'finetune-gsm8k'
+wandb_project = 'finetune-gsm8k-constant-lr'
 wandb_run_name = 'lora'
 
 batch_size = 8
@@ -20,13 +20,12 @@ lora_alpha = 128
 lora_dropout = 0.05
 
 # hyperparameters
-learning_rate = 1e-4
-min_lr = 1e-8
+learning_rate = 2e-4
 warmup_iters = 20
-epochs = 2
+epochs = 3.0
 
 # eval stuff
-eval_interval = 20    # number of train steps after which to log train/val loss to wandb
+eval_interval = 100    # number of train steps after which to log train/val loss to wandb
 eval_iters = 100      # number of batches to estimate train/val loss
 log_interval = 10     # number of train steps after which to log current train loss to console
 
