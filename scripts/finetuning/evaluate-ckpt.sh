@@ -1,15 +1,14 @@
 #!/bin/bash
 #SBATCH --account=scavenger
 #SBATCH --job-name=eval-gsm8k
-#SBATCH --time=1:00:00
+#SBATCH --time=0:30:00
 #SBATCH --partition=scavenger
 #SBATCH --qos=scavenger
 #SBATCH --ntasks=1
 #SBATCH --gres=gpu:rtxa6000:1
-#SBATCH --cpus-per-task=4
+#SBATCH --cpus-per-task=1
 #SBATCH --mem=32G
 #SBATCH --output=/dev/null
-#--SBATCH --dependency=afterok:3246188
 
 export TOKENIZERS_PARALLELISM=true
 
